@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,11 +15,16 @@ import (
 )
 
 const (
+	learderPath   = "/leader"
 	workerPrefix  = "/workers/"
 	procPrefix    = "/procs/"
 	pendingPrefix = "/tasks/pending/"
 	runningPrefix = "/tasks/running/"
 )
+
+func init() {
+	rand.Seed(int64(time.Now().Nanosecond()))
+}
 
 // A Worker is defined by its IP uuid and quota
 type Worker struct {
@@ -47,12 +53,39 @@ func (w *Worker) procs() ([]string, error) {
 type Manager struct {
 	sync.Mutex
 
-	cli *clientv3.Client
+	leaseID  clientv3.LeaseID
+	isLeader bool
+	cli      *clientv3.Client
 }
 
 // NewManager returns a new manager
 func NewManager(cli *clientv3.Client) *Manager {
-	manager := &Manager{cli: cli}
+
+	resp, err := cli.Grant(context.TODO(), 2)
+	if err != nil {
+		panic(err)
+	}
+
+	leaseID := resp.ID
+
+	ch, err := cli.KeepAlive(context.TODO(), leaseID)
+	if err != nil {
+		panic(err)
+	}
+
+	go func() {
+		for {
+			<-ch
+		}
+	}()
+
+	manager := &Manager{
+		cli:      cli,
+		leaseID:  leaseID,
+		isLeader: false,
+	}
+	go manager.leaderElect()
+	go manager.watchLeader()
 	go manager.watchWorker()
 
 	manager.allocatePendingTasks()
@@ -80,6 +113,59 @@ func (m *Manager) workers() ([]Worker, error) {
 	return workers, nil
 }
 
+func (m *Manager) watchLeader() {
+	wChan := m.cli.Watch(context.TODO(), learderPath)
+
+	for wresp := range wChan {
+		for _, ev := range wresp.Events {
+			switch ev.Type {
+			case mvccpb.DELETE:
+				m.leaderElect()
+			}
+		}
+	}
+}
+
+// leaderElect elects for itself if no leader existed in quorum
+func (m *Manager) leaderElect() {
+reDo:
+	resp, err := m.cli.Get(context.TODO(), learderPath)
+	if err != nil {
+		panic(err)
+	}
+
+	if resp.Count == 0 {
+		isLeader, err := m.electSelf()
+		if err != nil {
+			panic(err)
+		}
+		if isLeader {
+			m.isLeader = true
+			fmt.Println("become leader")
+			return
+		}
+
+		sleepMs := time.Duration(int64(50 + rand.Int31n(50)))
+		time.Sleep(sleepMs)
+		goto reDo
+	}
+
+	return
+}
+
+func (m *Manager) electSelf() (bool, error) {
+	resp, err := m.cli.Txn(context.TODO()).
+		If(clientv3.Compare(clientv3.CreateRevision(learderPath), "=", 0)).
+		Then(clientv3.OpPut(learderPath, "1", clientv3.WithLease(m.leaseID))).
+		Commit()
+
+	if err != nil {
+		return false, err
+	}
+
+	return resp.Succeeded, nil
+}
+
 // watchWorker watches update in workers configuration
 func (m *Manager) watchWorker() {
 	wChan := m.cli.Watch(context.TODO(), workerPrefix, clientv3.WithPrefix())
@@ -87,6 +173,9 @@ func (m *Manager) watchWorker() {
 	for wresp := range wChan {
 		for _, ev := range wresp.Events {
 			uuid := string(ev.Kv.Key)
+			if !m.isLeader {
+				continue
+			}
 			switch ev.Type {
 			case mvccpb.PUT:
 				fmt.Printf("PUT %q : %q\n", uuid, ev.Kv.Value)
@@ -176,6 +265,10 @@ func (m *Manager) newTask(ts time.Time, task string) error {
 	m.Lock()
 	defer m.Unlock()
 
+	if !m.isLeader {
+		return errors.New("not leader")
+	}
+
 	pendingPath := m.pendingTaskPath(task)
 	pendingResp, err := m.cli.Get(context.TODO(), pendingPath)
 	if err != nil {
@@ -205,6 +298,10 @@ func (m *Manager) newTask(ts time.Time, task string) error {
 func (m *Manager) deleteTask(task string) error {
 	m.Lock()
 	defer m.Unlock()
+
+	if !m.isLeader {
+		return errors.New("not leader")
+	}
 
 	pendingPath := m.pendingTaskPath(task)
 	pendingResp, err := m.cli.Delete(context.TODO(), pendingPath)
@@ -244,12 +341,20 @@ func (m *Manager) newWorkerHandler() error {
 	m.Lock()
 	defer m.Unlock()
 
+	if !m.isLeader {
+		return errors.New("not leader")
+	}
+
 	return m.allocatePendingTasks()
 }
 
 func (m *Manager) delWorkerHandler(uuid string) error {
 	m.Lock()
 	defer m.Unlock()
+
+	if !m.isLeader {
+		return errors.New("not leader")
+	}
 
 	workerAddr := strings.TrimPrefix(uuid, workerPrefix)
 
