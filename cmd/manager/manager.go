@@ -209,7 +209,7 @@ func (m *Manager) allocatePendingTasks() error {
 }
 
 func (m *Manager) allocateOneTask(task string, ts string) error {
-	minUtilzation := float32(1.00001)
+	minUtilzation := float32(1.0)
 	allWorkerFull := true
 
 	workers, err := m.workers()
