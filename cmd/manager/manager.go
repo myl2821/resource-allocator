@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/concurrency"
 	"go.etcd.io/etcd/mvcc/mvccpb"
 )
 
@@ -53,35 +54,16 @@ func (w *Worker) procs() ([]string, error) {
 type Manager struct {
 	sync.Mutex
 
-	leaseID  clientv3.LeaseID
-	isLeader bool
 	cli      *clientv3.Client
+	session  *concurrency.Session
+	isLeader bool
 }
 
 // NewManager returns a new manager
-func NewManager(cli *clientv3.Client) *Manager {
-
-	resp, err := cli.Grant(context.TODO(), 2)
-	if err != nil {
-		panic(err)
-	}
-
-	leaseID := resp.ID
-
-	ch, err := cli.KeepAlive(context.TODO(), leaseID)
-	if err != nil {
-		panic(err)
-	}
-
-	go func() {
-		for {
-			<-ch
-		}
-	}()
-
+func NewManager(session *concurrency.Session) *Manager {
 	manager := &Manager{
-		cli:      cli,
-		leaseID:  leaseID,
+		session:  session,
+		cli:      session.Client(),
 		isLeader: false,
 	}
 	go manager.leaderElect()
@@ -156,7 +138,7 @@ reDo:
 func (m *Manager) electSelf() (bool, error) {
 	resp, err := m.cli.Txn(context.TODO()).
 		If(clientv3.Compare(clientv3.CreateRevision(learderPath), "=", 0)).
-		Then(clientv3.OpPut(learderPath, "1", clientv3.WithLease(m.leaseID))).
+		Then(clientv3.OpPut(learderPath, "1", clientv3.WithLease(m.session.Lease()))).
 		Commit()
 
 	if err != nil {

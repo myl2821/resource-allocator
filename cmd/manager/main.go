@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3/concurrency"
 )
 
 var (
@@ -26,7 +27,12 @@ func main() {
 	}
 	defer etcdCli.Close()
 
-	manager = NewManager(etcdCli)
+	etcdSession, err := concurrency.NewSession(etcdCli, concurrency.WithTTL(10))
+	if err != nil {
+		panic(err)
+	}
+	defer etcdSession.Close()
+	manager = NewManager(etcdSession)
 
 	http.HandleFunc("/task/add", addTaskHandler)
 	http.HandleFunc("/task/del", delTaskHandler)
